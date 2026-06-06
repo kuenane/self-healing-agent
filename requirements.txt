@@ -1,0 +1,22 @@
+# Core agent
+google-adk>=0.1.0
+google-generativeai>=0.8.0
+
+# Arize Phoenix observability
+arize-phoenix>=4.0.0
+openinference-instrumentation-google-adk>=0.1.0
+openinference-instrumentation-google-genai>=0.1.0
+
+# MCP client
+aiohttp>=3.9.0
+
+# State persistence
+redis[asyncio]>=5.0.0
+
+# ML / embeddings (optional — agent degrades gracefully without)
+sentence-transformers>=2.7.0
+scikit-learn>=1.4.0
+numpy>=1.26.0
+
+# Utilities
+python-dotenv>=1.0.0
