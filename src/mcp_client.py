@@ -38,7 +38,11 @@ class CircuitBreaker:
                 and datetime.now() - self.last_failure_time
                 > timedelta(seconds=self.recovery_timeout)
             ):
+                # Half-open probe: allow one attempt, reset the failure count
+                # so a single success fully closes the circuit and a single
+                # failure below threshold does not leave stale state.
                 self.state = CircuitState.HALF_OPEN
+                self.failure_count = 0
             else:
                 raise MCPError("Circuit breaker OPEN — service unavailable")
 
@@ -51,7 +55,11 @@ class CircuitBreaker:
         except Exception as e:
             self.failure_count += 1
             self.last_failure_time = datetime.now()
-            if self.failure_count >= self.failure_threshold:
+            if (
+                self.state == CircuitState.HALF_OPEN
+                or self.failure_count >= self.failure_threshold
+            ):
+                # A failed half-open probe reopens the circuit immediately.
                 self.state = CircuitState.OPEN
             raise e
 
@@ -64,8 +72,10 @@ class ArizeMCPClient:
     """
 
     def __init__(self, base_url: str = None, api_key: str = None):
+        # NOTE: PHOENIX_CLIENT_HEADERS is a *header string*, not a URL.
+        # The base URL comes from PHOENIX_MCP_URL (matching main.py docs).
         self.base_url = base_url or os.getenv(
-            "PHOENIX_CLIENT_HEADERS", "http://localhost:6006"
+            "PHOENIX_MCP_URL", "http://localhost:6006"
         )
         self.api_key = api_key or os.getenv("PHOENIX_API_KEY", "")
         self.session: Optional[aiohttp.ClientSession] = None
@@ -98,9 +108,13 @@ class ArizeMCPClient:
         params: Dict[str, Any],
         max_retries: int = 3,
     ) -> Dict[str, Any]:
-        """Call a Phoenix MCP tool via JSON-RPC with retry + circuit breaker."""
+        """Call a Phoenix MCP tool via JSON-RPC.
 
-        async def _make_request():
+        Each HTTP attempt goes through the circuit breaker, so retries are
+        counted as individual failures (not one logical failure per call).
+        """
+
+        async def _attempt():
             self.request_count += 1
             session = await self._get_session()
             payload = {
@@ -109,41 +123,42 @@ class ArizeMCPClient:
                 "params": {"name": tool_name, "arguments": params},
                 "id": self.request_count,
             }
+            async with session.post(
+                f"{self.base_url}/mcp",
+                json=payload,
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if "error" in data:
+                        raise MCPError(f"MCP error: {data['error']}")
+                    return data.get("result", {})
+                if response.status == 429:
+                    raise MCPError("Rate limited (HTTP 429)")
+                text = await response.text()
+                raise MCPError(f"HTTP {response.status}: {text}")
 
-            for attempt in range(max_retries):
-                try:
-                    async with session.post(
-                        f"{self.base_url}/mcp",
-                        json=payload,
-                    ) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            if "error" in data:
-                                raise MCPError(f"MCP error: {data['error']}")
-                            return data.get("result", {})
-                        elif response.status == 429:
-                            await asyncio.sleep(2**attempt)
-                            continue
-                        else:
-                            text = await response.text()
-                            raise MCPError(f"HTTP {response.status}: {text}")
-                except aiohttp.ClientError as e:
-                    if attempt == max_retries - 1:
-                        raise MCPError(f"Network error after {max_retries} attempts: {e}")
-                    await asyncio.sleep(2**attempt)
-                except asyncio.TimeoutError:
-                    if attempt == max_retries - 1:
-                        raise MCPError(f"Timeout after {max_retries} attempts")
-                    await asyncio.sleep(2**attempt)
+        last_error: Optional[Exception] = None
+        for attempt in range(max_retries):
+            try:
+                return await self.circuit_breaker.call(_attempt)
+            except MCPError as e:
+                # Circuit breaker open: no point retrying this call.
+                if self.circuit_breaker.state == CircuitState.OPEN and "OPEN" in str(e):
+                    last_error = e
+                    break
+                last_error = e
+                await asyncio.sleep(2**attempt)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_error = e
+                await asyncio.sleep(2**attempt)
 
-            raise MCPError(f"Failed to call {tool_name} after {max_retries} attempts")
-
-        try:
-            return await self.circuit_breaker.call(_make_request)
-        except MCPError as e:
-            self.error_count += 1
-            self.last_error = str(e)
-            raise
+        self.error_count += 1
+        self.last_error = str(last_error)
+        if isinstance(last_error, MCPError):
+            raise last_error
+        raise MCPError(
+            f"Failed to call {tool_name} after {max_retries} attempts: {last_error}"
+        )
 
     async def health_check(self) -> bool:
         try:
@@ -151,8 +166,8 @@ class ArizeMCPClient:
             async with session.get(
                 f"{self.base_url}/healthz",
                 timeout=aiohttp.ClientTimeout(total=5),
-            ):
-                return True
+            ) as response:
+                return response.status < 400
         except Exception:
             return False
 

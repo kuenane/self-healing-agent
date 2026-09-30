@@ -452,30 +452,38 @@ Access dashboard:
 
 ## 🔐 Human Approval Gate
 
-The agent detects destructive operations and pauses for approval:
+The agent detects destructive operations using **word-boundary matching**
+(so "summarize how we removed duplicates" does NOT trigger it, while
+"purge production tables" does) and pauses for approval:
 
 ```python
 DESTRUCTIVE_KEYWORDS = {
-    "delete", "remove", "drop", "truncate", "alter",
-    "modify_schema", "restart", "shutdown", "kill",
+    "delete", "remove", "purge", "drop", "truncate", "alter",
+    "modify_schema", "restart", "shutdown", "kill", "destroy", "wipe",
 }
 
 async def _check_approval_required(self, task: str) -> bool:
-    return any(kw in task.lower() for kw in self.DESTRUCTIVE_KEYWORDS)
+    lowered = task.lower()
+    return any(
+        re.search(rf"\b{re.escape(kw)}\b", lowered)
+        for kw in self.DESTRUCTIVE_KEYWORDS
+    )
 ```
 
-When triggered:
+When triggered, the proposed action is **persisted** (Redis or in-memory),
+so it survives restarts — the gate is not just a return value:
+
 ```python
-if await self._check_approval_required(enhanced_task):
-    return {
-        "tool_calls": [],
-        "tokens_used": 0,
-        "requires_approval": True,
-        "proposed_action": {
-            "task": task,
-            "reason": "destructive_operation_detected",
-        },
-    }
+result = await agent.execute("Delete all test datasets")
+assert result.requires_approval is True
+
+# List everything awaiting a decision:
+pending = await agent.state_manager.list_pending_approvals()
+
+# Human decides:
+await agent.approve(pending[0]["id"])   # executes the task, bypassing the gate
+# or
+await agent.reject(pending[0]["id"])    # marks rejected, never executes
 ```
 
 ## 📈 Performance Metrics
@@ -506,26 +514,37 @@ print(f"Trend: {report['improvement_trend']['trend']}")
 
 ```
 self-healing-agent/
-├── agent_core.py           # 6-phase orchestration engine (446 lines)
-├── mcp_client.py           # Arize Phoenix MCP client with circuit breaker (173 lines)
-├── state_manager.py        # Redis state persistence (192 lines)
-├── error_handler.py        # Graceful error handling & recovery (153 lines)
-├── metrics.py              # Execution metrics (56 lines)
-├── main.py                 # Demo entry point (79 lines)
-├── requirements.txt        # Python dependencies
-├── test_agent.py           # Test suite
-├── setup.sh                # Setup script
-└── README.md               # This file
+├── src/
+│   ├── __init__.py         # Public package API
+│   ├── agent_core.py       # 6-phase orchestration engine
+│   ├── mcp_client.py       # Arize Phoenix MCP client with circuit breaker
+│   ├── state_manager.py    # Redis persistence + pending approvals
+│   ├── error_handler.py    # Graceful error handling & recovery
+│   └── metrics.py          # Execution metrics
+├── tests/
+│   ├── test_agent.py       # State manager, metrics, errors, circuit breaker
+│   └── test_agent_core.py  # 6-phase loop, approval gate, success semantics
+├── .github/workflows/ci.yml
+├── main.py                 # Demo entry point — run: python main.py
+├── conftest.py             # pytest path setup
+├── requirements.txt        # Runtime dependencies
+├── requirements-dev.txt    # Test dependencies
+├── Dockerfile
+├── docker-compose.yml
+├── setup.sh
+└── README.md
 ```
 
 ## 🧪 Testing
 
 ```bash
-# Run tests
-python -m pytest test_agent.py -v
+pip install -r requirements-dev.txt
+
+# Run tests (no Redis/Phoenix/Gemini needed)
+python -m pytest tests/ -v
 
 # Run with coverage
-python -m pytest test_agent.py --cov=. --cov-report=html
+python -m pytest tests/ --cov=src --cov-report=html
 ```
 
 ## 🔄 Integration with Google Agent Builder

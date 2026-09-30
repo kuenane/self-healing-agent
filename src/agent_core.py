@@ -12,11 +12,15 @@ Fixes applied vs original:
 """
 import asyncio
 import hashlib
+import logging
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from enum import Enum
 from collections import defaultdict
+
+logger = logging.getLogger(__name__)
 
 try:
     import numpy as np
@@ -34,7 +38,10 @@ from .metrics import ExecutionMetrics, MetricsCalculator
 
 
 class AgentPhase(Enum):
+    """The strict 6-phase reasoning loop (see README)."""
+
     TRACE = "trace"
+    RETRIEVE = "retrieve"
     EXECUTE = "execute"
     EVALUATE = "evaluate"
     LEARN = "learn"
@@ -63,7 +70,14 @@ class ExecutionResult:
 # ── Stub ADK types (replaced when google-adk is installed) ────────────────
 
 class _StubAgent:
-    """Minimal stub so the module loads without google-adk installed."""
+    """Minimal stub so the module loads without google-adk installed.
+
+    It performs NO real work; results from it must never be reported as
+    successful executions (see SelfHealingAgent.execute).
+    """
+
+    is_stub = True
+
     def __init__(self, **kwargs):
         self._kwargs = kwargs
 
@@ -78,14 +92,19 @@ def _make_agent(name, model, tools, instruction):
     try:
         from google.adk import Agent
         from google.adk.models.lite_llm import LiteLlm
-        return Agent(
+        agent = Agent(
             name=name,
             model=LiteLlm(model=model),
             tools=tools,
             instruction=instruction,
         )
+        agent.is_stub = False
+        return agent
     except ImportError:
-        print("google-adk not installed — using stub agent.")
+        logger.warning(
+            "google-adk not installed — using stub agent. No real LLM calls "
+            "will be made and no execution will be marked successful."
+        )
         return _StubAgent(name=name)
 
 
@@ -98,9 +117,12 @@ class SelfHealingAgent:
     """
 
     DESTRUCTIVE_KEYWORDS = {
-        "delete", "remove", "drop", "truncate", "alter",
-        "modify_schema", "restart", "shutdown", "kill",
+        "delete", "remove", "purge", "drop", "truncate", "alter",
+        "modify_schema", "restart", "shutdown", "kill", "destroy", "wipe",
     }
+
+    #: Minimum correctness score for an execution to count as successful.
+    SUCCESS_THRESHOLD = 0.7
 
     def __init__(
         self,
@@ -119,7 +141,9 @@ class SelfHealingAgent:
             try:
                 self.embedder = SentenceTransformer(embedding_model)
             except Exception as e:
-                print(f"Embedder not loaded ({e}) — pattern matching disabled.")
+                logger.warning(
+                    "Embedder not loaded (%s) — pattern matching disabled.", e
+                )
 
         self._embedding_cache: Dict[str, Any] = {}
 
@@ -163,7 +187,7 @@ class SelfHealingAgent:
         key = hashlib.md5(text.encode()).hexdigest()
         if key in self._embedding_cache:
             return self._embedding_cache[key]
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         vec = await loop.run_in_executor(None, self.embedder.encode, text)
         self._embedding_cache[key] = vec
         return vec
@@ -212,7 +236,13 @@ class SelfHealingAgent:
         return [p for _, p in results[:5]]
 
     async def _check_approval_required(self, task: str) -> bool:
-        return any(kw in task.lower() for kw in self.DESTRUCTIVE_KEYWORDS)
+        # Word-boundary matching: "summarize how we removed duplicates" must
+        # NOT trigger the gate, while "purge production tables" must.
+        lowered = task.lower()
+        return any(
+            re.search(rf"\b{re.escape(kw)}\b", lowered)
+            for kw in self.DESTRUCTIVE_KEYWORDS
+        )
 
     async def _execute_with_memory(
         self,
@@ -228,15 +258,29 @@ class SelfHealingAgent:
 
         enhanced_task = task + memory_context
 
-        if await self._check_approval_required(enhanced_task):
+        # Gate on the ORIGINAL task text. Enhanced with memory-context the
+        # word-boundary check could false-positive on stored failure
+        # descriptions that merely mention destructive words.
+        if await self._check_approval_required(task):
+            approval_id = f"approval_{trace_id}"
+            proposed = {
+                "task": task,
+                "reason": "destructive_operation_detected",
+                "approval_id": approval_id,
+            }
+            # Persist so the pending action survives restarts and can be
+            # resolved later via approve() / reject().
+            await self.state_manager.save_pending_approval(approval_id, proposed)
+            logger.info(
+                "Destructive operation gated (approval_id=%s): %s",
+                approval_id,
+                task[:120],
+            )
             return {
                 "tool_calls": [],
                 "tokens_used": 0,
                 "requires_approval": True,
-                "proposed_action": {
-                    "task": task,
-                    "reason": "destructive_operation_detected",
-                },
+                "proposed_action": proposed,
             }
 
         result = await self.agent.run(enhanced_task)
@@ -246,6 +290,75 @@ class SelfHealingAgent:
             "requires_approval": False,
             "proposed_action": None,
         }
+
+    async def approve(self, approval_id: str) -> Optional[ExecutionResult]:
+        """Human approved a gated action: mark it approved and execute it."""
+        rec = await self.state_manager.resolve_approval(approval_id, approved=True)
+        if rec is None:
+            logger.warning("Unknown approval_id %s", approval_id)
+            return None
+        task = rec["action"]["task"]
+        # Execute with the gate bypassed for this one approved task.
+        similar = await self._retrieve_similar_failures(task)
+        trace_id = await self._create_trace(task, {"approved_via": approval_id})
+        result = await self.agent.run(task)
+        exec_result = {
+            "tool_calls": getattr(result, "tool_calls", []),
+            "tokens_used": getattr(result, "tokens_used", 0),
+            "requires_approval": False,
+            "proposed_action": None,
+        }
+        metrics = await self._evaluate_execution(exec_result, trace_id)
+        return self._build_result(
+            task, trace_id, exec_result, metrics, [], datetime.now()
+        )
+
+    async def reject(self, approval_id: str) -> Optional[dict]:
+        """Human rejected a gated action: mark it rejected, never execute."""
+        return await self.state_manager.resolve_approval(approval_id, approved=False)
+
+    def _build_result(
+        self,
+        task: str,
+        trace_id: str,
+        exec_result: Dict,
+        metrics: ExecutionMetrics,
+        applied: List[str],
+        start: datetime,
+    ) -> ExecutionResult:
+        """Assemble an ExecutionResult with honest success semantics.
+
+        A run only counts as successful when it scores above the threshold
+        AND actually executed (not gated on approval, not a stub agent run).
+        """
+        is_stub_run = bool(getattr(self.agent, "is_stub", False))
+        gated = exec_result.get("requires_approval", False)
+        success = (
+            metrics.correctness_score >= self.SUCCESS_THRESHOLD
+            and not is_stub_run
+            and not gated
+        )
+        if is_stub_run:
+            logger.warning(
+                "Stub agent in use — recording run but NOT marking it successful. "
+                "Install google-adk to enable real execution."
+            )
+        return ExecutionResult(
+            task=task,
+            trace_id=trace_id,
+            success=success,
+            correctness_score=metrics.correctness_score,
+            efficiency_score=metrics.efficiency_score,
+            completeness_score=metrics.completeness_score,
+            tool_calls_made=exec_result.get("tool_calls", []),
+            tokens_used=exec_result.get("tokens_used", 0),
+            duration_ms=int((datetime.now() - start).total_seconds() * 1000),
+            learned_patterns_applied=applied,
+            requires_approval=gated,
+            proposed_action=exec_result.get("proposed_action"),
+            error=None,
+            timestamp=datetime.now(),
+        )
 
     async def _evaluate_execution(
         self, execution_result: Dict, trace_id: str
@@ -361,34 +474,22 @@ class SelfHealingAgent:
             if patterns:
                 applied = await self._apply_learned_patterns(patterns, trace_id)
 
-            # Persist execution record
+            result = self._build_result(
+                task, trace_id, exec_result, metrics, applied, datetime.now()
+            )
+
+            # Persist execution record (gated and stub runs are recorded too,
+            # but never marked successful).
             await self.state_manager.save_execution(
                 ExecutionRecord(
                     trace_id=trace_id,
                     task=task,
-                    success=metrics.correctness_score >= 0.7,
+                    success=result.success,
                     correctness=metrics.correctness_score,
                     timestamp=datetime.now(),
                 )
             )
-
-            duration_ms = int((datetime.now() - start).total_seconds() * 1000)
-            return ExecutionResult(
-                task=task,
-                trace_id=trace_id,
-                success=metrics.correctness_score >= 0.7,
-                correctness_score=metrics.correctness_score,
-                efficiency_score=metrics.efficiency_score,
-                completeness_score=metrics.completeness_score,
-                tool_calls_made=exec_result.get("tool_calls", []),
-                tokens_used=exec_result.get("tokens_used", 0),
-                duration_ms=duration_ms,
-                learned_patterns_applied=applied,
-                requires_approval=exec_result.get("requires_approval", False),
-                proposed_action=exec_result.get("proposed_action"),
-                error=None,
-                timestamp=datetime.now(),
-            )
+            return result
 
         except Exception as e:
             duration_ms = int((datetime.now() - start).total_seconds() * 1000)

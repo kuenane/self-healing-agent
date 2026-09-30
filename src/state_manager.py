@@ -3,9 +3,13 @@ State management with Redis persistence.
 Falls back to in-memory storage when Redis is unavailable.
 """
 import json
+import logging
+import warnings
 from typing import Dict, List, Optional
 from datetime import datetime
 from dataclasses import dataclass, asdict
+
+logger = logging.getLogger(__name__)
 
 try:
     import redis.asyncio as redis
@@ -74,13 +78,21 @@ class StateManager:
         # In-memory fallback stores
         self._memory_patterns: Dict[str, FailurePattern] = {}
         self._memory_history: Dict[str, ExecutionRecord] = {}
+        self._memory_approvals: Dict[str, dict] = {}
 
         self._pattern_key = "agent:failure_patterns"
         self._history_key = "agent:execution_history"
+        self._approval_key = "agent:pending_approvals"
 
     async def connect(self) -> bool:
         if not REDIS_AVAILABLE:
-            print("redis package not installed — using in-memory state.")
+            warnings.warn(
+                "redis package not installed — using VOLATILE in-memory state. "
+                "All learned patterns, history, and pending approvals are lost "
+                "on restart.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return False
         try:
             self._redis = await redis.from_url(
@@ -93,7 +105,13 @@ class StateManager:
             self._use_redis = True
             return True
         except Exception as e:
-            print(f"Redis unavailable ({e}) — using in-memory state.")
+            warnings.warn(
+                f"Redis unavailable ({e}) — using VOLATILE in-memory state. "
+                "All learned patterns, history, and pending approvals are lost "
+                "on restart.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return False
 
     # ── Patterns ──────────────────────────────────────────────────────────
@@ -176,6 +194,62 @@ class StateManager:
             [r for r in self._memory_history.values() if r.timestamp.timestamp() >= cutoff],
             key=lambda r: r.timestamp,
         )
+
+    # ── Pending approvals (human-in-the-loop gate) ────────────────────────
+
+    async def save_pending_approval(self, approval_id: str, action: dict) -> None:
+        """Persist a proposed destructive action awaiting human approval."""
+        record = {
+            "id": approval_id,
+            "action": action,
+            "status": "pending",
+            "created_at": datetime.now().isoformat(),
+        }
+        if self._use_redis:
+            await self._redis.set(
+                f"{self._approval_key}:{approval_id}",
+                json.dumps(record),
+            )
+            await self._redis.sadd(self._approval_key, approval_id)
+        else:
+            self._memory_approvals[approval_id] = record
+
+    async def get_pending_approval(self, approval_id: str) -> Optional[dict]:
+        if self._use_redis:
+            raw = await self._redis.get(f"{self._approval_key}:{approval_id}")
+            return json.loads(raw) if raw else None
+        return self._memory_approvals.get(approval_id)
+
+    async def list_pending_approvals(self) -> List[dict]:
+        """Return all approvals still awaiting a human decision."""
+        if self._use_redis:
+            ids = await self._redis.smembers(self._approval_key)
+            out = []
+            for aid in ids:
+                rec = await self.get_pending_approval(aid)
+                if rec and rec.get("status") == "pending":
+                    out.append(rec)
+            return out
+        return [
+            r for r in self._memory_approvals.values() if r.get("status") == "pending"
+        ]
+
+    async def resolve_approval(self, approval_id: str, approved: bool) -> Optional[dict]:
+        """Mark an approval as approved/rejected and return its record."""
+        rec = await self.get_pending_approval(approval_id)
+        if rec is None:
+            return None
+        rec["status"] = "approved" if approved else "rejected"
+        rec["resolved_at"] = datetime.now().isoformat()
+        if self._use_redis:
+            await self._redis.set(
+                f"{self._approval_key}:{approval_id}",
+                json.dumps(rec),
+            )
+            await self._redis.srem(self._approval_key, approval_id)
+        else:
+            self._memory_approvals[approval_id] = rec
+        return rec
 
     async def clear_old_data(self, days_to_keep: int = 30) -> None:
         if not self._use_redis:

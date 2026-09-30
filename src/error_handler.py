@@ -5,12 +5,16 @@ fallback responses, and critical alert routing.
 import asyncio
 import functools
 import traceback
+from collections import deque
 from typing import Any, Callable, Dict, Optional, Tuple, Type
 from datetime import datetime
 import logging
 
-logging.basicConfig(level=logging.INFO)
+# Library modules must not configure the root logger on import.
 logger = logging.getLogger(__name__)
+
+#: Cap in-process error history so long-running processes don't leak memory.
+MAX_ERROR_HISTORY = 1000
 
 
 class ErrorHandler:
@@ -24,8 +28,8 @@ class ErrorHandler:
 
     def __init__(self, mcp_client=None):
         self.mcp_client = mcp_client
-        self.error_history: list = []
-        self.critical_errors: list = []
+        self.error_history: deque = deque(maxlen=MAX_ERROR_HISTORY)
+        self.critical_errors: deque = deque(maxlen=MAX_ERROR_HISTORY)
 
     async def log_to_arize(
         self,
@@ -94,6 +98,15 @@ class ErrorHandler:
         }
 
 
+PERMANENT_ERROR_MARKERS = ("authentication", "api_key", "401", "403", "permission denied")
+
+
+def _is_permanent(error: Exception) -> bool:
+    """Errors that retrying can never fix (auth failures, permission errors)."""
+    msg = str(error).lower()
+    return any(marker in msg for marker in PERMANENT_ERROR_MARKERS)
+
+
 def with_retry(
     max_retries: int = 3,
     backoff_factor: int = 2,
@@ -101,6 +114,9 @@ def with_retry(
 ):
     """
     Async decorator: automatic retry with exponential backoff.
+
+    Permanent errors (authentication/authorization failures) are raised
+    immediately instead of being retried pointlessly.
 
     Usage:
         @with_retry(max_retries=3, exceptions=(MCPError, aiohttp.ClientError))
@@ -115,6 +131,9 @@ def with_retry(
                 try:
                     return await func(*args, **kwargs)
                 except exceptions as e:
+                    if _is_permanent(e):
+                        logger.error("%s failed permanently: %s", func.__name__, e)
+                        raise
                     last_exc = e
                     wait = backoff_factor**attempt
                     logger.warning(

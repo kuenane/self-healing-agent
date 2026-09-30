@@ -2,7 +2,7 @@
 main.py — Run the Arize Self-Healing Agent demo.
 
 Usage:
-    python main.py
+    python main.py        (from the repository root)
 
 Environment variables:
     PHOENIX_API_KEY     Your Phoenix Cloud API key (from app.phoenix.arize.com)
@@ -11,7 +11,27 @@ Environment variables:
     GEMINI_API_KEY      Your Gemini API key
 """
 import asyncio
+import logging
 import os
+import sys
+
+# Allow running from the repo root without installing the package.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Windows consoles often use cp1252; enable UTF-8 for ✓/✗/⚠ output.
+for stream in (sys.stdout, sys.stderr):
+    try:
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+# Logging is configured here — at the application entry point, not in
+# library modules.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 from src.mcp_client import ArizeMCPClient
 from src.agent_core import SelfHealingAgent
 
@@ -52,12 +72,25 @@ async def main():
         print(f"  efficiency     : {result.efficiency_score:.2f}")
         print(f"  duration_ms    : {result.duration_ms}")
         if result.requires_approval:
-            print(f"  ⚠  Paused — requires human approval")
+            print("  ⚠  Paused — requires human approval")
             print(f"     Proposed: {result.proposed_action}")
         if result.learned_patterns_applied:
             print(f"  Patterns applied: {result.learned_patterns_applied}")
         if result.error:
             print(f"  Error: {result.error}")
+        print()
+
+    # The approval gate persists pending actions — they survive restarts and
+    # can be resolved by a human later.
+    pending = await agent.state_manager.list_pending_approvals()
+    if pending:
+        print(f"Pending human approvals ({len(pending)}):")
+        for p in pending:
+            print(f"  {p['id']}: {p['action']['task']}")
+        # Demo: reject them all (replace with a real approval UI in production).
+        for p in pending:
+            await agent.reject(p["id"])
+            print(f"  → rejected {p['id']} (demo default; call agent.approve(id) to execute)")
         print()
 
     print("Performance report (last 7 days):")

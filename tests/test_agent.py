@@ -8,9 +8,6 @@ import pytest
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
 from src.state_manager import StateManager, FailurePattern, ExecutionRecord
 from src.error_handler import ErrorHandler, with_retry, fallback_response
 from src.metrics import MetricsCalculator
